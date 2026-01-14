@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       CPU:
-        type: choice
-        description: "SoC 分支"
+        description: "SoC branch"
         required: true
         default: sm8650
+        type: choice
         options:
           - sm7550
           - sm7675
@@ -19,10 +19,10 @@ on:
           - sm8850
 
       FEIL:
-        type: choice
         description: "OnePlus manifest"
         required: true
         default: oneplus_ace3_b
+        type: choice
         options:
           - oneplus_ace3_b
           - oneplus_ace3_pro_b
@@ -35,10 +35,10 @@ on:
           - oneplus_pad2_v
 
       CPUD:
-        type: choice
-        description: "CPU 代号"
+        description: "CPU code-name"
         required: true
         default: kalama
+        type: choice
         options:
           - crow
           - waipio
@@ -48,10 +48,10 @@ on:
           - canoe
 
       ANDROID_VERSION:
-        type: choice
-        description: "Android 版本"
+        description: "Android version"
         required: true
         default: android14
+        type: choice
         options:
           - android12
           - android13
@@ -60,10 +60,10 @@ on:
           - android16
 
       KERNEL_VERSION:
-        type: choice
-        description: "Kernel 版本"
+        description: "Kernel version"
         required: true
         default: "5.15"
+        type: choice
         options:
           - "5.10"
           - "5.15"
@@ -72,42 +72,41 @@ on:
           - "6.12"
 
       BUILD_METHOD:
-        type: choice
-        description: "构建方式"
+        description: "Build method"
         required: true
         default: gki
+        type: choice
         options:
           - gki
           - perf
 
       SUSFS_CI:
-        type: boolean
-        description: "SUSFS 使用 CI 构建模块"
+        description: "SUSFS CI module"
         required: true
         default: true
+        type: boolean
 
       VFS:
-        type: boolean
-        description: "启用 VFS Hook"
+        description: "Enable VFS hook"
         required: true
         default: true
+        type: boolean
 
       KPM:
-        type: boolean
-        description: "启用 KPM"
+        description: "Enable KPM"
         required: true
         default: true
+        type: boolean
 
       ZRAM:
-        type: boolean
-        description: "启用 ZRAM/LZ4KD"
+        description: "Enable ZRAM / LZ4KD"
         required: true
         default: false
+        type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
@@ -122,14 +121,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y git curl python3 jq
+          sudo apt-get update
+          sudo apt-get install -y git curl python3 python3-pip jq build-essential flex bison libssl-dev libncurses-dev libelf-dev ccache
 
       - name: Install repo tool
         run: |
-          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o repo
-          chmod +x repo
-          sudo mv repo /usr/local/bin/repo
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo -o /tmp/repo
+          chmod +x /tmp/repo
+          sudo mv /tmp/repo /usr/local/bin/repo
 
       - name: Show inputs
         run: |
@@ -144,40 +143,34 @@ jobs:
       - name: Initialize repo and sync
         run: |
           set -e
-          mkdir -p kernel_workspace
-          cd kernel_workspace
+          mkdir -p kernel_workspace && cd kernel_workspace
 
-          # 校验 manifest 是否存在
-          if ! curl -sf \
-            https://raw.githubusercontent.com/OnePlusOSS/kernel_manifest/oneplus/${{ github.event.inputs.CPU }}/${{ github.event.inputs.FEIL }}.xml \
-            > /dev/null; then
-            echo "::error::Manifest not found"
+          MANIFEST_URL="https://raw.githubusercontent.com/OnePlusOSS/kernel_manifest/oneplus/${{ github.event.inputs.CPU }}/${{ github.event.inputs.FEIL }}.xml"
+          echo "Checking manifest: $MANIFEST_URL"
+          curl -sf "$MANIFEST_URL" -o /dev/null || {
+            echo "::error::Manifest not found: $MANIFEST_URL"
             exit 1
-          fi
+          }
 
           repo init \
             -u https://github.com/OnePlusOSS/kernel_manifest.git \
             -b oneplus/${{ github.event.inputs.CPU }} \
             -m ${{ github.event.inputs.FEIL }}.xml \
-            --depth=1 \
-            --no-tags \
-            --no-clone-bundle
+            --depth=1 --no-tags --no-clone-bundle
 
           repo sync -c -j$(nproc) --force-sync --no-tags --no-clone-bundle
 
           for dir in kernel_platform/common kernel_platform/msm-kernel; do
-            if [ -f "$dir/BUILD.bazel" ]; then
-              sed -i '/"protected_exports_list"/d' "$dir/BUILD.bazel"
-            fi
+            [ -f "$dir/BUILD.bazel" ] && sed -i '/"protected_exports_list"/d' "$dir/BUILD.bazel"
             rm -f "$dir/android/abi_gki_protected_exports_"* || true
           done
 
-      # ===== 去掉 -dirty =====
+      # ===== Remove -dirty =====
       - name: Remove -dirty suffix
         run: |
           cd kernel_workspace/kernel_platform
           for f in common/scripts/setlocalversion msm-kernel/scripts/setlocalversion; do
-            sed -i 's/ -dirty//g' "$f"
+            [ -f "$f" ] && sed -i 's/ -dirty//g' "$f"
           done
 
       # ===== KernelSU Ultra =====
@@ -195,21 +188,39 @@ jobs:
           cd kernel_workspace
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}
           cd kernel_platform/common
-          cp ../../susfs4ksu/kernel_patches/*.patch ./
-          patch -p1 < *.patch || true
+          for p in ../../susfs4ksu/kernel_patches/*.patch; do patch -p1 < "$p" || true; done
+
+      # ===== Kconfig additions =====
+      - name: Extra Kconfig
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          CONFIG=arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU=y"                                        >> "$CONFIG"
+          echo "CONFIG_KSU_SUSFS=y"                                  >> "$CONFIG"
+          [ "${{ github.event.inputs.KPM }}" = "true" ]       && echo "CONFIG_KPM=y" >> "$CONFIG"
+          [ "${{ github.event.inputs.ZRAM }}" = "true" ]      && echo "CONFIG_CRYPTO_LZ4KD=y" >> "$CONFIG"
+          [ "${{ github.event.inputs.VFS }}" = "true" ]       && echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$CONFIG"
 
       # ===== Build =====
       - name: Build kernel (Bazel)
         if: ${{ github.event.inputs.CPU == 'sm8650' || github.event.inputs.CPU == 'sm7675' }}
         run: |
           cd kernel_workspace
-          ./kernel_platform/build_with_bazel.py -t ${{ github.event.inputs.CPUD }} gki
+          ./kernel_platform/build_with_bazel.py -t ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }}
+
+      - name: Find Image
+        id: find
+        run: |
+          cd kernel_workspace
+          IMG=$(find . -type f -name Image -exec file {} \; | grep 'Linux kernel ARM64 boot' | head -n1 | awk -F: '{print $1}')
+          [ -n "$IMG" ] || { echo "::error::Image not found"; exit 1; }
+          echo "img=$IMG" >> $GITHUB_OUTPUT
 
       # ===== AnyKernel3 =====
       - name: Make AnyKernel3
         run: |
-          git clone https://github.com/Numbersf/AnyKernel3
-          cp kernel_workspace/kernel_platform/**/Image AnyKernel3/Image || exit 1
+          git clone https://github.com/Numbersf/AnyKernel3 --depth=1
+          cp ${{ steps.find.outputs.img }} AnyKernel3/Image
 
       - name: Upload AnyKernel3
         uses: actions/upload-artifact@v4
